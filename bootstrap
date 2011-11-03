@@ -2,14 +2,14 @@
 %% This escript bootstraps libconf for your system.
 %% Call it like so:
 %%      ./bootstrap [command]
-%%
+%% 
 %% Where command is one of
 %%  * install  - installs libconf and any dependent tools
 %%  * generate - creates a configure.erl from a config file
 %%  * build    - creates a binary escript (archive) from a configure.erl input
 %%  * auto     - (the default) performs `install' followed by generate and/or
 %%               build, depending on your config file
-%%
+%% 
 
 -define(CONFIG(K, C, D), (case lists:keymember(K, 1, C) of false -> D;
                                 _ -> element(2, lists:keyfind(K, 1, C)) end)).
@@ -40,7 +40,7 @@ execute(["--help"]) ->
     io:format(re:replace(Comments, "%% ", "",
               [global, {return, list}]) ++ "~n"),
     halt(0);
-execute([_Command|_Args]) ->
+execute(_) ->
     Proj = setup(load_config()),
     io:format("~p~n", [Proj]),
     ok.
@@ -55,6 +55,7 @@ setup(#project{
     ok.
 
 mkdir(Path) ->
+    io:format("Ensure ~s~n", [Path]),
     case filelib:ensure_dir(Path) of
         ok ->
             file:make_dir(Path);
@@ -147,8 +148,10 @@ load_config() ->
             after
                 file:close(Fd)
             end;
+        {error, enoent} ->
+            abort("bootstrap.config file not found!~n", []);
         E2 ->
-            E2
+            abort("Unable to load config: ~p~n", [E2])
     end.
 
 ext_config_fn_handler(Func, Args) when is_function(Func) ->
