@@ -11,6 +11,8 @@
 %%               build, depending on your config file
 %% 
 
+-include_lib("kernel/include/file.hrl").
+
 -define(CONFIG(K, C, D), (case lists:keymember(K, 1, C) of false -> D;
                                 _ -> element(2, lists:keyfind(K, 1, C)) end)).
 -define(CONFIG(K1, K2, C, D), ?CONFIG(K2, ?CONFIG(K1, C, []), D)).
@@ -21,6 +23,7 @@
     build_dir,
     deps_dir,
     temp_dir,
+    rebar_bin,
     config
 }).
 
@@ -45,14 +48,81 @@ execute(_) ->
     io:format("~p~n", [Proj]),
     ok.
 
-setup(#project{
+setup(P=#project{
         build_dir=Base,
         deps_dir=Lib,
         temp_dir=Temp,
         config=Config }) ->
     [ mkdir(Path) || Path <- [Base, Lib, Temp] ],
-    _Rebar = verify_rebar_install(?PATH([Temp, "rebar.zip"]), Config),
-    ok.
+    Rebar = verify_rebar_install(?PATH([Temp, "rebar.zip"]), Config),
+    install_alt_deps(Base, Config),
+    BuildConf = verify_build_config(P),
+    P#project{ rebar_bin=Rebar }.
+
+install_alt_deps(Base, Config) ->
+    PluginDir = ?PATH([Base, "plugins"]),
+    mkdir(PluginDir),
+    case fetch("https://github.com/hyperthunk/rebar_alt_deps/zipball/master",
+               ?PATH([PluginDir, "rebar_alt_deps.erl"]), Config) of
+        {ok, _} ->
+            ok;
+        Err ->
+            abort("Unable to fetch rebar_alt_deps: ~p~n", [Err])
+    end.
+
+verify_build_config(#project{ build_dir=Base, deps_dir=Lib, config=Config }) ->
+    Cfg = generate_config(Base, Lib, Config),
+    write_config(Cfg, Base).
+
+generate_config(Base, Lib, Config) ->
+    Overrides = ?CONFIG(rebar_config, Config, []),
+    Opts = default_rebar_config(Base, Lib, Config),
+    lists:map(apply_config_overrides(Overrides), Opts).
+
+apply_config_overrides(Overrides) ->
+    fun({K, V}=Pair) ->
+        case lists:keyfind(K, 1, Overrides) of
+            false ->
+                Pair;
+            NewValue ->
+                NewValue
+        end
+    end.
+
+default_rebar_config(Base, Lib, Config) ->
+    DepsDir = ?CONFIG(rebar_config, deps_dir, Config, "lib"),
+    [{deps_dir, DepsDir},
+     {alt_deps, [{libconf, ".*"}]},
+     {alt_repositories, [{libconf, {github, "hyperthunk"}}]},
+     {plugin_dir, ?PATH([Base, "plugins"])},
+     {plugins, [rebar_alt_deps]}].
+
+rewrite_opts(BaseConfig) ->
+    fun(Key, Opts) ->
+        Replacement = proplists:get_value(Key, BaseConfig, undefined),
+        overwrite({Key, Replacement}, Opts)
+    end.
+
+overwrite({Key, [_|_]=Value}, Opts) ->
+    case lists:keyfind(Key, 1, Opts) of
+        false ->
+            [{Key, Value}|Opts];
+        {Key, Config} when is_list(Config) ->
+            lists:keyreplace(Key, 1, Opts, {Key, Value ++ Config});
+        _ ->
+            lists:keyreplace(Key, 1, Opts, {Key, Value})
+    end;
+overwrite({_Key, []}, Opts) ->
+    Opts;
+overwrite({_Key, undefined}, Opts) ->
+    Opts;
+overwrite({Key, Value}, Opts) ->
+    case lists:keyfind(Key, 1, Opts) of
+        false ->
+            [{Key, Value}|Opts];
+        _ ->
+            lists:keyreplace(Key, 1, Opts, {Key, Value})
+    end.
 
 mkdir(Path) ->
     io:format("Ensure ~s~n", [Path]),
@@ -70,6 +140,7 @@ verify_rebar_install(Target, Config) ->
         false ->
             install_rebar(Target, Config);
         Path ->
+            io:format("Using previously installed rebar: ~s~n", [Path]),
             Path
     end.
 
@@ -79,6 +150,7 @@ install_rebar(Target, Config) ->
     Exe = filename:join(Dest, "rebar"),
     case filelib:is_regular(Exe) of
         true ->
+            io:format("Using previously installed rebar: ~s~n", [Exe]),
             Exe;
         false ->
             Url = "https://github.com/basho/rebar/zipball/master",
@@ -96,15 +168,23 @@ install_rebar(Target, Config) ->
                             [ file:write_file(rename(Path, Dest),
                                                 Data, [write]) ||
                                                 {Path, Data} <- FileList ],
+                            Bootstrap = ?PATH([Dest, "bootstrap"]),
+                            chmod_x(Bootstrap),
+                            io:format("building rebar using ~s~n", [Bootstrap]),
                             case exec("./bootstrap", [{cd, Dest}]) of
                                 {ok, _} ->
-                                    Exe;
+                                    chmod_x(Exe), Exe;
                                 Err ->
                                 abort("Unable to compile rebar: ~p~n", [Err])
                             end
                     end
             end
     end.
+
+chmod_x(File) ->
+    io:format("chmod +x ~s~n", [File]),
+    {ok, FI} = file:read_file_info(File),
+    ok = file:change_mode(File, FI#file_info.mode bor 8#00100).
 
 exec(Command, Env) ->
     PortSettings = [exit_status, {line, 16384}, stderr_to_stdout, hide],
@@ -125,7 +205,7 @@ sh_loop(Port, Acc) ->
 rename(Path, Dest) ->
     [_|P] = filename:split(Path),
     Target = filename:join(Dest, filename:join(P)),
-    rebar_utils:ensure_dir(Target),
+    filelib:ensure_dir(Target),
     Target.
 
 abort(Msg, Args) ->
@@ -154,11 +234,6 @@ load_config() ->
             abort("Unable to load config: ~p~n", [E2])
     end.
 
-ext_config_fn_handler(Func, Args) when is_function(Func) ->
-    Func(Args);
-ext_config_fn_handler({Mod, Func}, Args) ->
-    apply(Mod, Func, Args).
-
 eval_stream(Fd, Handling, Bs) ->
     eval_stream(Fd, Handling, 1, undefined, [], Bs).
 
@@ -166,7 +241,13 @@ eval_stream(Fd, H, Line, Last, E, Bs) ->
     eval_stream2(io:parse_erl_exprs(Fd, '', Line), Fd, H, Last, E, Bs).
 
 eval_stream2({ok,Form,EndLine}, Fd, H, Last, E, Bs0) ->
-    try erl_eval:exprs(Form, Bs0, none, {value, fun ext_config_fn_handler/2}) of
+    try erl_eval:exprs(Form, Bs0, none,
+                        {value,
+                        fun(Func, Args) when is_function(Func) ->
+                            Func(Args);
+                           ({Mod, Func}, Args) ->
+                            erlang:apply(Mod, Func, Args)
+                        end}) of
         {value, V, Bs} ->
             eval_stream(Fd, H, EndLine, {V}, E, Bs)
     catch Class:Reason ->
@@ -210,19 +291,19 @@ fetch(Url, Target, C) ->
             end,
             put({?MODULE, httpc}, started)
     end,
-    rebar_utils:ensure_dir(Target),
+    mkdir(filename:dirname(Target)),
     Request = {Url, [{"User-Agent", "Erlang-Rebar"}]},
-    rebar_log:log(debug, "Attempting to fetch ~s into ~s~n", [Url, Target]),
+    io:format("Attempting to fetch ~s into ~s~n", [Url, Target]),
     case httpc:request(get, Request, [{relaxed, true}],
                                      [{stream, Target}, {full_result, true}]) of
         {ok, saved_to_file} ->
-            rebar_log:log(debug, "Successfully fetched tag...~n", []),
+            io:format("Successfully fetched remote archive...~n", []),
             {ok, Target};
         {ok, {{_, 404, _}, _, _}} ->
-            rebar_log:log(warn, "~s not found!~n", [Url]),
+            io:format("~s not found!~n", [Url]),
             {error, missing};
         Error ->
-            rebar_log:log(warn, "Error trying to load remote: ~p~n", [Error]),
+            io:format("Error trying to load remote: ~p~n", [Error]),
             {error, Error}
     end.
 
